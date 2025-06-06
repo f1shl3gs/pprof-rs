@@ -77,7 +77,7 @@ pub use inferno::flamegraph;
 #[allow(clippy::all)]
 #[cfg(all(feature = "prost-codec", not(feature = "protobuf-codec")))]
 pub mod protos {
-    pub use prost::Message;
+    pub use prost::{Message, EncodeError};
 
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
