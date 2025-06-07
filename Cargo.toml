@@ -37,7 +37,7 @@ thiserror = "2.0"
 findshlibs = "0.10"
 smallvec = "1.7"
 
-inferno = { version = "0.11", default-features = false, features = ["nameattr"], optional = true }
+inferno = { version = "0.12", default-features = false, features = ["nameattr"], optional = true }
 prost = { version = "0.13", optional = true }
 prost-derive = { version = "0.13", optional = true }
 protobuf = { version = ">=3.7.2", optional = true }
