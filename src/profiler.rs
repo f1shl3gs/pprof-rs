@@ -1,10 +1,10 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::convert::TryInto;
+use std::mem;
 use std::os::raw::c_int;
 use std::time::SystemTime;
 
-use nix::sys::signal;
 use once_cell::sync::Lazy;
 use smallvec::SmallVec;
 use spin::RwLock;
@@ -449,22 +449,38 @@ impl Profiler {
     }
 
     fn register_signal_handler(&self) -> Result<()> {
-        let handler = signal::SigHandler::SigAction(perf_signal_handler);
-        let sigaction = signal::SigAction::new(
-            handler,
-            // SA_RESTART will only restart a syscall when it's safe to do so,
-            // e.g. when it's a blocking read(2) or write(2). See man 7 signal.
-            signal::SaFlags::SA_SIGINFO | signal::SaFlags::SA_RESTART,
-            signal::SigSet::empty(),
-        );
-        unsafe { signal::sigaction(signal::SIGPROF, &sigaction) }?;
+        let s = unsafe {
+            let mut s = mem::MaybeUninit::<libc::sigaction>::uninit();
+            let p = s.as_mut_ptr();
+
+            (*p).sa_sigaction = perf_signal_handler as *const extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as usize;
+            (*p).sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            let mut sigset = mem::MaybeUninit::<libc::sigset_t>::uninit();
+            libc::sigemptyset(sigset.as_mut_ptr());
+            (*p).sa_mask = sigset.assume_init();
+            s.assume_init()
+        };
+
+        let mut old_action = mem::MaybeUninit::uninit();
+        let ret = unsafe {
+            libc::sigaction(
+                libc::SIGPROF,
+                &s as *const libc::sigaction,
+                old_action.as_mut_ptr(),
+            )
+        };
+        if ret == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
 
         Ok(())
     }
 
     fn unregister_signal_handler(&self) -> Result<()> {
-        let handler = signal::SigHandler::SigIgn;
-        unsafe { signal::signal(signal::SIGPROF, handler) }?;
+        let ret = unsafe { libc::signal(libc::SIGPROF, libc::SIG_IGN) };
+        if ret == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error().into());
+        }
 
         Ok(())
     }

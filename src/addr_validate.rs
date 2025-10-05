@@ -3,11 +3,6 @@ use std::{
     sync::atomic::{AtomicI32, Ordering},
 };
 
-use nix::{
-    errno::Errno,
-    unistd::{close, read, write},
-};
-
 struct Pipes {
     read_fd: AtomicI32,
     write_fd: AtomicI32,
@@ -20,40 +15,62 @@ static MEM_VALIDATE_PIPE: Pipes = Pipes {
 
 #[inline]
 #[cfg(any(target_os = "android", target_os = "linux"))]
-fn create_pipe() -> nix::Result<(i32, i32)> {
-    use nix::fcntl::OFlag;
-    use nix::unistd::pipe2;
+fn create_pipe() -> std::io::Result<(i32, i32)> {
+    let mut fds = [0i32; 2];
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr().cast(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
 
-    pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+    Ok((fds[0], fds[1]))
 }
 
 #[inline]
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn create_pipe() -> nix::Result<(i32, i32)> {
-    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-    use nix::unistd::pipe;
-    use std::os::unix::io::RawFd;
+fn create_pipe() -> std::io::Result<(i32, i32)> {
+    fn set_flags(fd: i32) -> std::io::Result<()> {
+        let mut flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
 
-    fn set_flags(fd: RawFd) -> nix::Result<()> {
-        let mut flags = FdFlag::from_bits(fcntl(fd, FcntlArg::F_GETFD)?).unwrap();
-        flags |= FdFlag::FD_CLOEXEC;
-        fcntl(fd, FcntlArg::F_SETFD(flags))?;
-        let mut flags = OFlag::from_bits(fcntl(fd, FcntlArg::F_GETFL)?).unwrap();
-        flags |= OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(flags))?;
+        flags |= libc::FD_CLOEXEC;
+
+        let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
+        if ret == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        flags |= libc::O_NONBLOCK;
+        let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        if ret == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+
         Ok(())
     }
 
-    let (read_fd, write_fd) = pipe()?;
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr().cast()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let [ read_fd, write_fd ] = fds;
+
     set_flags(read_fd)?;
     set_flags(write_fd)?;
     Ok((read_fd, write_fd))
 }
 
-fn open_pipe() -> nix::Result<()> {
+fn open_pipe() -> std::io::Result<()> {
     // ignore the result
-    let _ = close(MEM_VALIDATE_PIPE.read_fd.load(Ordering::SeqCst));
-    let _ = close(MEM_VALIDATE_PIPE.write_fd.load(Ordering::SeqCst));
+    unsafe {
+        let _ = libc::close(MEM_VALIDATE_PIPE.read_fd.load(Ordering::SeqCst));
+        let _ = libc::close(MEM_VALIDATE_PIPE.write_fd.load(Ordering::SeqCst));
+    }
 
     let (read_fd, write_fd) = create_pipe()?;
 
@@ -82,12 +99,23 @@ pub fn validate(addr: *const libc::c_void) -> bool {
     let valid_read = loop {
         let mut buf = [0u8; CHECK_LENGTH];
 
-        match read(read_fd, &mut buf) {
-            Ok(bytes) => break bytes > 0,
-            Err(_err @ Errno::EINTR) => continue,
-            Err(_err @ Errno::EAGAIN) => break true,
-            Err(_) => break false,
+        let ret = unsafe {
+            libc::read(
+                read_fd,
+                buf.as_mut_ptr() as *mut _,
+                CHECK_LENGTH,
+            )
+        };
+        if ret == -1 {
+            let err = std::io::Error::last_os_error();
+            match err.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => break true,
+                _ => break false,
+            }
         }
+
+        break ret > 0
     };
 
     if !valid_read && open_pipe().is_err() {
@@ -98,11 +126,17 @@ pub fn validate(addr: *const libc::c_void) -> bool {
     loop {
         let buf = unsafe { std::slice::from_raw_parts(addr as *const u8, CHECK_LENGTH) };
 
-        match write(write_fd, buf) {
-            Ok(bytes) => break bytes > 0,
-            Err(_err @ Errno::EINTR) => continue,
-            Err(_) => break false,
+        let ret = unsafe { libc::write(write_fd, buf.as_ptr() as *const _, CHECK_LENGTH) };
+        if ret == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+
+            break false
         }
+
+        break ret >= 0
     }
 }
 
